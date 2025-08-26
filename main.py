@@ -48,12 +48,12 @@ class PlaneTracker:
         # Commercial airline codes (major carriers only)
         self.commercial_airlines = {
             'BAW', 'VIR', 'EZY', 'RYR',  # UK carriers
-            'UAL', 'AAL', 'DAL', 'SWA', 'JBU', 'ASA',  # US carriers  
-            'AFR', 'DLH', 'KLM', 'IBE', 'AZA', 'SAS',  # European carriers
+            'UAL', 'AAL', 'DAL', 'JBU',  # US carriers  
+            'AFR', 'DLH', 'KLM', 'IBE', 'SAS',  # European carriers
             'UAE', 'ETD', 'QTR', 'SVA', 'THY',  # Middle East carriers
             'SIA', 'CPA', 'JAL', 'ANA', 'QFA',  # Asia Pacific carriers
             'ACA', 'WJA',  # Canadian carriers
-            'TAM', 'GOL', 'LAN', 'AZU',  # South American carriers
+            'TAM', 'LAN',  # South American carriers
         }
         
         self.planes = []
@@ -105,6 +105,7 @@ class PlaneTracker:
         self.clock_only = False
         self.count_overlay_until = 0
         self.last_cycle = None
+        self.fetch_due_at = 0
 
         # Night mode (UK time): 00:00–08:00 show clock only and dim display
         try:
@@ -146,6 +147,12 @@ class PlaneTracker:
             self.GITHUB_LOGOS_RAW_BASE = GITHUB_LOGOS_RAW_BASE
         except NameError:
             self.GITHUB_LOGOS_RAW_BASE = "https://raw.githubusercontent.com/steveberryman/galactic-flight-tracker/main/logos"
+
+        # API interval (seconds) coerced to float/int to avoid type issues
+        try:
+            self.API_INTERVAL = int(self._to_float(API_UPDATE_INTERVAL, 10))
+        except Exception:
+            self.API_INTERVAL = 10
         
         # Tiny 3x5 font for compact date/time (dictionary of glyph bitmaps)
         self._tiny_font = {
@@ -375,7 +382,8 @@ class PlaneTracker:
         # Draw plane icon (fitted 11x11) using logo or silhouette fallback
         self.draw_plane_symbol(0, 0)
 
-        current_time = time.localtime()
+        # Use UK local time (UTC with BST adjustment)
+        current_time = self._uk_localtime()
         date_str = f"{current_time[2]:02d}/{current_time[1]:02d}"
         time_str = f"{current_time[3]:02d}:{current_time[4]:02d}"
 
@@ -982,7 +990,7 @@ class PlaneTracker:
                 self.auth_token = None
                 self.token_expires = 0
                 # Wait before retry
-                self.last_api_update = time.time() + 60
+                self.fetch_due_at = time.time() + 60
                 
             elif response.status_code == 403:
                 print("✗ 403 Forbidden - check credentials")
@@ -990,19 +998,19 @@ class PlaneTracker:
                 # Clear invalid token and wait longer
                 self.auth_token = None
                 self.token_expires = 0
-                self.last_api_update = time.time() + 300  # 5 minute delay
+                self.fetch_due_at = time.time() + 300  # 5 minute delay
                 
             elif response.status_code == 503:
                 print("✗ 503 Service Unavailable - OpenSky API down")
                 response.close()
                 # Wait longer before next attempt when API is down
-                self.last_api_update = time.time() + 60  # Wait 1 minute
+                self.fetch_due_at = time.time() + 60  # Wait 1 minute
                 
             elif response.status_code == 429:
                 print("✗ 429 Rate Limited")
                 response.close()
                 # Wait much longer if rate limited
-                self.last_api_update = time.time() + 300  # 5 minute delay
+                self.fetch_due_at = time.time() + 300  # 5 minute delay
                 
             else:
                 print(f"✗ API Error: {response.status_code}")
@@ -1272,6 +1280,10 @@ class PlaneTracker:
             if self.wifi_connected and (not self.ntp_ok or (current_time - self.ntp_last_sync > self.NTP_SYNC_INTERVAL)):
                 self.sync_ntp()
             
+            # Initialize fetch_due_at so the first loop triggers an update
+            if self.fetch_due_at == 0:
+                self.fetch_due_at = current_time
+
             # Periodic GitHub logos re-sync
             if current_time - self.last_logos_sync > self.LOGOS_SYNC_INTERVAL:
                 try:
@@ -1282,9 +1294,10 @@ class PlaneTracker:
                 gc.collect()
             
             # Update plane data periodically (skip during night mode)
-            if not self.night_mode and (current_time - self.last_api_update > API_UPDATE_INTERVAL):
+            if not self.night_mode and current_time >= self.fetch_due_at:
                 self.fetch_planes()
                 self.last_api_update = current_time
+                self.fetch_due_at = current_time + self.API_INTERVAL
             
             # Update display
             self.update_display()
@@ -1301,7 +1314,10 @@ class PlaneTracker:
             if self.gu.is_pressed(GalacticUnicorn.SWITCH_D):
                 # Force immediate API update
                 self.fetch_planes()
-                self.last_api_update = time.time()
+                now = time.time()
+                self.last_api_update = now
+                # Kick the scheduler so periodic updates resume without button
+                self.fetch_due_at = now + self.API_INTERVAL
                 time.sleep(0.3)
             
             time.sleep(DISPLAY_UPDATE_INTERVAL)
