@@ -44,6 +44,8 @@ class PlaneTracker:
         self.MAGENTA = self.graphics.create_pen(255, 0, 255)
         self.ORANGE = self.graphics.create_pen(255, 128, 0)
         self.LIGHTBLUE = self.graphics.create_pen(120, 180, 255)
+        # Extra hues for route rendering
+        self.DARK_ORANGE = self.graphics.create_pen(200, 100, 0)
         
         # Commercial airline codes (major carriers only)
         self.commercial_airlines = {
@@ -153,8 +155,26 @@ class PlaneTracker:
             self.API_INTERVAL = int(self._to_float(API_UPDATE_INTERVAL, 10))
         except Exception:
             self.API_INTERVAL = 10
-        
-        # Tiny 3x5 font for compact date/time (dictionary of glyph bitmaps)
+
+        # Route (ADSBdb) cache
+        self.route_cache = {}
+        self.callsign_iata_cache = {}
+        self.route_last_fetch_times = {}
+        try:
+            self.ROUTE_TTL = ROUTE_TTL
+        except NameError:
+            self.ROUTE_TTL = 1800  # 30 minutes
+        self.last_route_fetch_time = 0
+
+        # Route (ADSBdb) cache
+        self.route_cache = {}
+        try:
+            self.ROUTE_TTL = ROUTE_TTL
+        except NameError:
+            self.ROUTE_TTL = 1800  # 30 minutes
+        self.last_route_fetch_time = 0
+
+        # Tiny 3x5 font for compact text (date/time/route)
         self._tiny_font = {
             '0': [0b111, 0b101, 0b101, 0b101, 0b111],
             '1': [0b010, 0b110, 0b010, 0b010, 0b111],
@@ -168,7 +188,161 @@ class PlaneTracker:
             '9': [0b111, 0b101, 0b111, 0b001, 0b111],
             '/': [0b001, 0b001, 0b010, 0b100, 0b100],
             ':': [0b000, 0b010, 0b000, 0b010, 0b000],
+            '-': [0b000, 0b000, 0b111, 0b000, 0b000],
+            '>': [0b100, 0b010, 0b001, 0b010, 0b100],
+            'A': [0b010, 0b101, 0b111, 0b101, 0b101],
+            'B': [0b110, 0b101, 0b110, 0b101, 0b110],
+            'C': [0b011, 0b100, 0b100, 0b100, 0b011],
+            'D': [0b110, 0b101, 0b101, 0b101, 0b110],
+            'E': [0b111, 0b100, 0b110, 0b100, 0b111],
+            'F': [0b111, 0b100, 0b110, 0b100, 0b100],
+            'G': [0b011, 0b100, 0b101, 0b101, 0b011],
+            'H': [0b101, 0b101, 0b111, 0b101, 0b101],
+            'I': [0b111, 0b010, 0b010, 0b010, 0b111],
+            'J': [0b001, 0b001, 0b001, 0b101, 0b010],
+            'K': [0b101, 0b110, 0b100, 0b110, 0b101],
+            'L': [0b100, 0b100, 0b100, 0b100, 0b111],
+            'M': [0b101, 0b111, 0b111, 0b101, 0b101],
+            'N': [0b101, 0b111, 0b111, 0b111, 0b101],
+            'O': [0b111, 0b101, 0b101, 0b101, 0b111],
+            'P': [0b111, 0b101, 0b111, 0b100, 0b100],
+            'Q': [0b111, 0b101, 0b101, 0b111, 0b001],
+            'R': [0b111, 0b101, 0b111, 0b110, 0b101],
+            'S': [0b011, 0b100, 0b011, 0b001, 0b110],
+            'T': [0b111, 0b010, 0b010, 0b010, 0b010],
+            'U': [0b101, 0b101, 0b101, 0b101, 0b111],
+            'V': [0b101, 0b101, 0b101, 0b101, 0b010],
+            'W': [0b101, 0b101, 0b111, 0b111, 0b101],
+            'X': [0b101, 0b101, 0b010, 0b101, 0b101],
+            'Y': [0b101, 0b101, 0b010, 0b010, 0b010],
+            'Z': [0b111, 0b001, 0b010, 0b100, 0b111],
         }
+        
+    def tiny_text_width(self, s):
+        n = len(s)
+        if n <= 0:
+            return 0
+        return n * 3 + (n - 1)
+
+    def draw_tiny_text(self, s, x, y, pen):
+        self.graphics.set_pen(pen)
+        cx = x
+        for ch in s:
+            glyph = self._tiny_font.get(ch)
+            if glyph is None:
+                cx += 4
+                continue
+            for row in range(5):
+                bits = glyph[row]
+                for col in range(3):
+                    if (bits & (1 << (2 - col))) != 0:
+                        self.graphics.pixel(cx + col, y + row)
+            cx += 4
+
+    def draw_route_tiny(self, route_str, x, y, code_pen, arrow_pen):
+        """Draw route like ABC->DEF with different color for arrow."""
+        if not route_str:
+            return
+        cx = x
+        for ch in route_str:
+            glyph = self._tiny_font.get(ch)
+            # Choose pen: arrow chars '-' and '>'
+            if ch in ('-', '>'):
+                self.graphics.set_pen(arrow_pen)
+            else:
+                self.graphics.set_pen(code_pen)
+            if glyph is None:
+                cx += 4
+                continue
+            for row in range(5):
+                bits = glyph[row]
+                for col in range(3):
+                    if (bits & (1 << (2 - col))) != 0:
+                        self.graphics.pixel(cx + col, y + row)
+            cx += 4
+
+    def _norm_callsign(self, callsign):
+        try:
+            return (callsign or "").strip().upper()
+        except Exception:
+            return callsign or ""
+
+    def get_cached_route(self, callsign):
+        callsign = self._norm_callsign(callsign)
+        if not callsign:
+            return None
+        item = self.route_cache.get(callsign)
+        if not item:
+            return None
+        route_str, ts = item
+        if time.time() - ts > self.ROUTE_TTL:
+            return None
+        return route_str
+
+    def fetch_route(self, callsign):
+        # Throttle lookups per callsign
+        callsign = self._norm_callsign(callsign)
+        now = time.time()
+        last = self.route_last_fetch_times.get(callsign, 0)
+        if now - last < 5:
+            return self.route_cache.get(callsign, (None, 0))[0]
+        self.route_last_fetch_times[callsign] = now
+        try:
+            url = f"https://api.adsbdb.com/v0/callsign/{callsign.lower()}"
+            try:
+                r = urequests.get(url, timeout=5)
+            except TypeError:
+                r = urequests.get(url)
+            if r.status_code == 200:
+                data = r.json()
+                r.close()
+                resp = data.get('response', {})
+                fr = resp.get('flightroute', {})
+                org = fr.get('origin', {})
+                dst = fr.get('destination', {})
+                o = (org.get('iata_code') or '').upper()
+                d = (dst.get('iata_code') or '').upper()
+                if o and d:
+                    route_str = f"{o}>{d}"
+                    self.route_cache[callsign] = (route_str, now)
+                # Cache IATA callsign if present (inside flightroute)
+                iata_cs = (fr.get('callsign_iata') or '').upper()
+                if iata_cs:
+                    self.callsign_iata_cache[callsign] = (iata_cs, now)
+                return self.route_cache.get(callsign, (None, 0))[0]
+            else:
+                r.close()
+        except Exception:
+            pass
+        return None
+
+    def get_route(self, callsign):
+        route = self.get_cached_route(callsign)
+        if route is not None:
+            return route
+        return self.fetch_route(callsign)
+
+    def get_display_callsign(self, callsign):
+        # Prefer IATA callsign if recently cached; fall back to ICAO callsign
+        if not callsign:
+            return ""
+        norm = self._norm_callsign(callsign)
+        item = self.callsign_iata_cache.get(norm)
+        if item:
+            cs, ts = item
+            if time.time() - ts <= self.ROUTE_TTL and cs:
+                return cs
+        # Try to fetch once to populate cache (throttled in fetch_route)
+        try:
+            self.fetch_route(norm)
+        except Exception:
+            pass
+        item = self.callsign_iata_cache.get(norm)
+        if item:
+            cs, ts = item
+            if time.time() - ts <= self.ROUTE_TTL and cs:
+                return cs
+        return norm
         
     def draw_png(self, filename, x, y):
         """Draw PNG file at specified position using correct PicoGraphics method"""
@@ -183,7 +357,7 @@ class PlaneTracker:
                 print(f"Failed to draw PNG {filename}: {e}")
                 return False
         return False
-
+    
     def _to_float(self, value, default=0.0):
         """Safely convert value to float. If list/tuple, take first element."""
         try:
@@ -351,11 +525,11 @@ class PlaneTracker:
         if self.draw_png_fitted_11("plane.png", x, y):
             return True
         # Fallback silhouette
-        self.graphics.set_pen(self.WHITE)
-        for i in range(11):
-            for j in range(11):
-                if (i == 5 and 2 <= j <= 8) or (j == 5 and 3 <= i <= 7) or (i == 2 and j == 5) or (i == 8 and j == 5):
-                    self.graphics.pixel(x + i, y + j)
+            self.graphics.set_pen(self.WHITE)
+            for i in range(11):
+                for j in range(11):
+                    if (i == 5 and 2 <= j <= 8) or (j == 5 and 3 <= i <= 7) or (i == 2 and j == 5) or (i == 8 and j == 5):
+                        self.graphics.pixel(x + i, y + j)
         return True
     
     def get_airline_png_filename(self, airline_code):
@@ -386,43 +560,19 @@ class PlaneTracker:
         current_time = self._uk_localtime()
         date_str = f"{current_time[2]:02d}/{current_time[1]:02d}"
         time_str = f"{current_time[3]:02d}:{current_time[4]:02d}"
-
+        
         # Render tiny text (3x5) centered in right-hand area
         left_x = 13
         avail_w = max(0, self.width - left_x)
 
-        def tiny_text_width(s):
-            # 3px per glyph + 1px space between, no trailing space
-            n = len(s)
-            if n <= 0:
-                return 0
-            return n * 3 + (n - 1) * 1
-
-        date_w = tiny_text_width(date_str)
-        time_w = tiny_text_width(time_str)
+        date_w = self.tiny_text_width(date_str)
+        time_w = self.tiny_text_width(time_str)
         block_w = max(date_w, time_w)
         draw_x = left_x + max(0, (avail_w - block_w) // 2)
 
-        def draw_tiny(s, x, y, pen):
-            self.graphics.set_pen(pen)
-            cx = x
-            for ch in s:
-                glyph = self._tiny_font.get(ch)
-                if glyph is None:
-                    # unknown glyph: space width
-                    cx += 4
-                    continue
-                # 3 columns x 5 rows
-                for row in range(5):
-                    bits = glyph[row]
-                    for col in range(3):
-                        if (bits & (1 << (2 - col))) != 0:
-                            self.graphics.pixel(cx + col, y + row)
-                cx += 4  # 3px glyph + 1px space
-
         # Date on first line (y=0), time on second line (y=6 to create 1px gap)
-        draw_tiny(date_str, draw_x, 0, self.LIGHTBLUE)
-        draw_tiny(time_str, draw_x, 6, self.YELLOW)
+        self.draw_tiny_text(date_str, draw_x, 0, self.LIGHTBLUE)
+        self.draw_tiny_text(time_str, draw_x, 6, self.YELLOW)
     
     def draw_corner_indicators(self, color):
         """Draw LEDs in corners to show system status"""
@@ -451,7 +601,7 @@ class PlaneTracker:
         self.graphics.text(text, x, y, scale=1)
 
     def draw_callsign_two_tone(self, callsign, x, y, code_color, suffix_color):
-        """Draw callsign as CODE+SUFFIX with different colors, variable width, clipped to screen."""
+        """Draw callsign as CODE+SUFFIX with different colors. Detect IATA vs ICAO to set code length (2 vs 3)."""
         # Ensure no clipping interferes with text
         self._clear_clip_safe()
         # Use small bitmap font if available
@@ -464,8 +614,12 @@ class PlaneTracker:
         if max_w <= 0:
             return
 
-        code = (callsign[:3] if len(callsign) >= 3 else callsign).upper()
-        suffix = callsign[3:] if len(callsign) > 3 else ""
+        cs = (callsign or "").upper()
+        # Heuristic: if first 3 are all letters and not in IATA airline code set, default to 3; otherwise 2
+        # Simpler: if third char is a digit, use 2; else 3. Works for most IATA (AA123, BA4832) vs ICAO (BAW123).
+        airline_len = 2 if (len(cs) >= 3 and cs[2].isdigit()) else 3
+        code = cs[:airline_len]
+        suffix = cs[airline_len:] if len(cs) > airline_len else ""
 
         def fit_text(s, limit_w):
             if not s or limit_w <= 0:
@@ -1075,7 +1229,7 @@ class PlaneTracker:
             self.next_frame_key = None
             self.draw_plane_icon_with_time()
             return
-
+        
         # Show yellow corners when fetching data
         if self.fetching_data:
             self.draw_corner_indicators(self.YELLOW)
@@ -1151,70 +1305,33 @@ class PlaneTracker:
             return
         callsign = plane.get('callsign', '').strip()
 
-        # Swipe-up animation between frames (no animation when only 1 plane)
-        single_plane_mode = (num_planes == 1)
-        frame_key = (f"PL:{callsign}" if single_plane_mode and cycle != 4 else f"{cycle}:{callsign}")
-        # Use millisecond ticks for smoother, monotonic timing
-        try:
-            now_ms = time.ticks_ms()
-        except Exception:
-            now_ms = int(current_time * 1000)
-        # Snap if we just came from a clock frame (cycle 4 -> plane)
-        came_from_clock = (self.last_cycle == 4)
-        if self.current_frame_key is None or came_from_clock or (single_plane_mode and cycle != 4):
-            self.anim_active = False
-            self.current_frame_key = frame_key
-            self.next_frame_key = None
-        elif frame_key != self.current_frame_key and not self.anim_active:
-            # Start animation to new frame
-            self.anim_active = True
-            self.anim_start_time = now_ms
-            self.next_frame_key = frame_key
-
-        y_offset_current = 0
-        y_offset_next = self.height  # start below
-        if self.anim_active:
-            # compute progress 0..1
-            elapsed_ms = max(0, (now_ms - self.anim_start_time))
-            duration_ms = int(self.anim_duration * 1000)
-            t = min(1.0, elapsed_ms / duration_ms) if duration_ms > 0 else 1.0
-            shift = int(t * self.height)
-            y_offset_current = -shift
-            y_offset_next = self.height - shift
-            if t >= 1.0:
-                # complete
-                self.anim_active = False
-                self.current_frame_key = self.next_frame_key
-                y_offset_current = 0
-                y_offset_next = 0
-
-        # Draw logo snaps to the new frame when next is in place
-        if not self.anim_active:
-            self.draw_logo_for_callsign(callsign)
-            self.draw_callsign_two_tone(callsign, 13, 2, self.WHITE, self.LIGHTBLUE)
-        else:
-            # Determine current/next callsigns
-            part = self.current_frame_key.split(":",1)[0] if self.current_frame_key else ""
+        # Draw current plane without animation
+        self.draw_logo_for_callsign(callsign)
+        display_cs = self.get_display_callsign(callsign)
+        self.draw_callsign_two_tone(display_cs, 13, -1, self.WHITE, self.LIGHTBLUE)
+        route = self.get_route(callsign)
+        if route:
+            # Draw route with normal font: YELLOW code, ORANGE arrow, YELLOW code
             try:
-                cur_cycle = int(part)
+                self.graphics.set_font("bitmap6")
             except Exception:
-                cur_cycle = cycle
-            cur_idx = (plane_cycle * 4 + cur_cycle) % num_planes
-            cur_callsign = self.display_queue[cur_idx].get('callsign','').strip() if num_planes else ''
-            next_callsign = callsign
-            # Draw current scrolled up, next scrolling in
-            if y_offset_next <= 0:
-                # next has arrived, snap to next logo
-                self.draw_logo_for_callsign(next_callsign)
-            else:
-                self.draw_logo_for_callsign(cur_callsign)
-            self.draw_callsign_two_tone_at_offset(cur_callsign, y_offset_current)
-            self.draw_callsign_two_tone_at_offset(next_callsign, y_offset_next)
+                pass
+            # Split on '>'
+            parts = route.split('>')
+            if len(parts) == 2:
+                o, d = parts[0], parts[1]
+                x = 13
+                y = 5
+                self.graphics.set_pen(self.YELLOW)
+                self.graphics.text(o, x, y, scale=1)
+                x += int(self.graphics.measure_text(o, scale=1))
+                self.graphics.set_pen(self.ORANGE)
+                self.graphics.text('>', x, y, scale=1)
+                x += int(self.graphics.measure_text('>', scale=1))
+                self.graphics.set_pen(self.YELLOW)
+                self.graphics.text(d, x, y, scale=1)
 
         # (removed bottom overlay; handled earlier as a full-screen overlay)
-
-        # Track last cycle for next frame's snap decision
-        self.last_cycle = cycle
     
     def update_display(self):
         """Update the LED matrix display"""
@@ -1271,7 +1388,7 @@ class PlaneTracker:
             self.last_logos_sync = time.time()
         except Exception as e:
             print(f"Logo sync failed: {e}")
-
+        
         # Main loop
         while True:
             current_time = time.time()
